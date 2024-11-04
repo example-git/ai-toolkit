@@ -127,12 +127,14 @@ class NetworkConfig:
         if lorm is not None:
             self.lorm_config: LoRMConfig = LoRMConfig(**lorm)
 
-        if self.type == 'lorm':
+        if self.type == 'lorm' or self.type == 'locon':
             # set linear to arbitrary values so it makes them
-            self.linear = 4
-            self.rank = 4
-            if self.lorm_config.do_conv:
-                self.conv = 4
+            self.linear = 16
+            self.rank = 16
+            if self.type == 'locon':
+                self.conv = 16
+            elif self.lorm_config.do_conv:
+                self.conv = 16
 
         self.transformer_only = kwargs.get('transformer_only', True)
 
@@ -394,8 +396,6 @@ class TrainConfig:
 class ModelConfig:
     def __init__(self, **kwargs):
         self.name_or_path: str = kwargs.get('name_or_path', None)
-        # name or path is updated on fine tuning. Keep a copy of the original
-        self.name_or_path_original: str = self.name_or_path
         self.is_v2: bool = kwargs.get('is_v2', False)
         self.is_xl: bool = kwargs.get('is_xl', False)
         self.is_pixart: bool = kwargs.get('is_pixart', False)
@@ -451,13 +451,7 @@ class ModelConfig:
         self.attn_masking = kwargs.get("attn_masking", False)
         if self.attn_masking and not self.is_flux:
             raise ValueError("attn_masking is only supported with flux models currently")
-        # for targeting a specific layers
-        self.ignore_if_contains: Optional[List[str]] = kwargs.get("ignore_if_contains", None)
-        self.only_if_contains: Optional[List[str]] = kwargs.get("only_if_contains", None)
-        
-        if self.ignore_if_contains is not None or self.only_if_contains is not None:
-            if not self.is_flux:
-                raise ValueError("ignore_if_contains and only_if_contains are only supported with flux models currently")
+        pass
 
 
 class EMAConfig:
@@ -899,3 +893,11 @@ class GenerateImageConfig:
             return
 
         self.logger.log_image(image, count, self.prompt)
+    def log_all_images(self, img_list):
+        if self.logger is None:
+            return
+        if img_list is None:
+            return
+        self.logger.log_all_images(img_list)
+    def return_prompt(self, image, count: int = 0):
+        return self.prompt

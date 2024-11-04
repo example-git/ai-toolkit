@@ -30,6 +30,7 @@ class LoConSpecialModule(ToolkitModuleMixin, LoConModule, ExtractableModuleMixin
             use_cp=False,
             network: 'LycorisSpecialNetwork' = None,
             use_bias=False,
+            wd=False,
             **kwargs,
     ):
         """ if alpha == 0 or None, alpha is rank (no scaling). """
@@ -106,6 +107,37 @@ class LoConSpecialModule(ToolkitModuleMixin, LoConModule, ExtractableModuleMixin
     def load_weight_hook(self, *args, **kwargs):
         self.scalar = nn.Parameter(torch.ones_like(self.scalar))
 
+    # def apply_to(self, text_encoder, unet, apply_text_encoder=None, apply_unet=None):
+    #     assert (
+    #         apply_text_encoder is not None and apply_unet is not None
+    #     ), f"internal error: flag not set"
+
+    #     if apply_text_encoder:
+    #         logger.info("enable LyCORIS for text encoder")
+    #     else:
+    #         self.text_encoder_loras = []
+
+    #     if apply_unet:
+    #         logger.info("enable LyCORIS for U-Net")
+    #     else:
+    #         self.unet_loras = []
+
+    #     self.loras = self.text_encoder_loras + self.unet_loras
+
+    #     for lora in self.loras:
+    #         lora.apply_to()
+    #         self.add_module(lora.lora_name, lora)
+
+    #     if self.weights_sd:
+    #         # if some weights are not in state dict, it is ok because initial LoRA does nothing (lora_up is initialized by zeros)
+    #         info = self.load_state_dict(self.weights_sd, False)
+    #         logger.info(f"weights are loaded: {info}")
+
+
+    def apply_to(self):
+        self.org_forward = self.org_module[0].forward
+        self.org_module[0].forward = self.forward
+
 
 class LycorisSpecialNetwork(ToolkitNetworkMixin, LycorisNetwork):
     UNET_TARGET_REPLACE_MODULE = [
@@ -113,28 +145,6 @@ class LycorisSpecialNetwork(ToolkitNetworkMixin, LycorisNetwork):
         "ResnetBlock2D",
         "Downsample2D",
         "Upsample2D",
-        # 'UNet2DConditionModel',
-        # 'Conv2d',
-        # 'Timesteps',
-        # 'TimestepEmbedding',
-        # 'Linear',
-        # 'SiLU',
-        # 'ModuleList',
-        # 'DownBlock2D',
-        # 'ResnetBlock2D',  # need
-        # 'GroupNorm',
-        # 'LoRACompatibleConv',
-        # 'LoRACompatibleLinear',
-        # 'Dropout',
-        # 'CrossAttnDownBlock2D', # needed
-        # 'Transformer2DModel',  # maybe not, has duplicates
-        # 'BasicTransformerBlock', # duplicates
-        # 'LayerNorm',
-        # 'Attention',
-        # 'FeedForward',
-        # 'GEGLU',
-        # 'UpBlock2D',
-        # 'UNetMidBlock2DCrossAttn'
     ]
     UNET_TARGET_REPLACE_NAME = [
         "conv_in",
@@ -142,6 +152,9 @@ class LycorisSpecialNetwork(ToolkitNetworkMixin, LycorisNetwork):
         "time_embedding.linear_1",
         "time_embedding.linear_2",
     ]
+    LORA_PREFIX_UNET = "lora_unet"
+    LORA_PREFIX_TEXT_ENCODER = "lora_te"
+
     def __init__(
             self,
             text_encoder: Union[List[CLIPTextModel], CLIPTextModel],
@@ -162,6 +175,12 @@ class LycorisSpecialNetwork(ToolkitNetworkMixin, LycorisNetwork):
             use_text_encoder_2: bool = True,
             use_bias: bool = False,
             is_lorm: bool = False,
+            is_sdxl: bool = False,
+            is_v2: bool = False,
+            is_v3: bool = False,
+            is_pixart: bool = False,
+            is_auraflow: bool = False,
+            is_flux: bool = False,
             **kwargs,
     ) -> None:
         # call ToolkitNetworkMixin super
@@ -169,6 +188,8 @@ class LycorisSpecialNetwork(ToolkitNetworkMixin, LycorisNetwork):
             self,
             train_text_encoder=train_text_encoder,
             train_unet=train_unet,
+            is_sdxl=is_sdxl,
+            is_v2=is_v2,
             is_lorm=is_lorm,
             **kwargs
         )
@@ -213,6 +234,14 @@ class LycorisSpecialNetwork(ToolkitNetworkMixin, LycorisNetwork):
         self.rank_dropout = rank_dropout
         self.module_dropout = module_dropout
 
+        self.is_v3 = is_v3
+        self.is_pixart = is_pixart
+        self.is_auraflow = is_auraflow
+        self.is_flux = is_flux
+        self.is_sdxl = is_sdxl
+        self.is_v2 = is_v2
+        
+        
         # create module instances
         def create_modules(
                 prefix,
@@ -236,8 +265,6 @@ class LycorisSpecialNetwork(ToolkitNetworkMixin, LycorisNetwork):
                     for child_name, child_module in module.named_modules():
                         lora_name = prefix + '.' + name + '.' + child_name
                         lora_name = lora_name.replace('.', '_')
-                        if lora_name.startswith('lora_unet_input_blocks_1_0_emb_layers_1'):
-                            print(f"{lora_name}")
 
                         if child_module.__class__.__name__ in LINEAR_MODULES and lora_dim > 0:
                             lora = algo(
@@ -260,7 +287,7 @@ class LycorisSpecialNetwork(ToolkitNetworkMixin, LycorisNetwork):
                                     use_cp,
                                     network=self,
                                     parent=module,
-                                use_bias=use_bias,
+                                    use_bias=use_bias,
                                     **kwargs
                                 )
                             elif conv_lora_dim > 0:
@@ -328,6 +355,20 @@ class LycorisSpecialNetwork(ToolkitNetworkMixin, LycorisNetwork):
                     loras.append(lora)
             return loras
 
+        
+        # Update target modules based on model type
+        if self.is_v3:
+            target_replace_modules = ["SD3Transformer2DModel"]
+        elif self.is_pixart:
+            target_replace_modules = ["PixArtTransformer2DModel"]
+        elif self.is_auraflow:
+            target_replace_modules = ["AuraFlowTransformer2DModel"]
+        elif self.is_flux:
+            target_replace_modules = ["FluxTransformer2DModel"]
+        else:
+            target_replace_modules = LycorisSpecialNetwork.UNET_TARGET_REPLACE_MODULE
+
+        
         if network_module == GLoRAModule:
             print('GLoRA enabled, only train transformer')
             # only train transformer (for GLoRA)
@@ -337,12 +378,18 @@ class LycorisSpecialNetwork(ToolkitNetworkMixin, LycorisNetwork):
             ]
             LycorisSpecialNetwork.UNET_TARGET_REPLACE_NAME = []
 
+        # Update prefix based on model type
+        unet_prefix = self.LORA_PREFIX_UNET
+        if self.is_pixart or self.is_v3 or self.is_auraflow or self.is_flux:
+            unet_prefix = "lora_transformer"
+
         if isinstance(text_encoder, list):
             text_encoders = text_encoder
             use_index = True
         else:
             text_encoders = [text_encoder]
             use_index = False
+
 
         self.text_encoder_loras = []
         if self.train_text_encoder:
@@ -351,18 +398,23 @@ class LycorisSpecialNetwork(ToolkitNetworkMixin, LycorisNetwork):
                     continue
                 if not use_text_encoder_2 and i == 1:
                     continue
+                prefix = self.LORA_PREFIX_TEXT_ENCODER + (f'{i + 1}' if use_index else '')
                 self.text_encoder_loras.extend(create_modules(
-                    LycorisSpecialNetwork.LORA_PREFIX_TEXT_ENCODER + (f'{i + 1}' if use_index else ''),
+                    prefix,
                     te,
                     LycorisSpecialNetwork.TEXT_ENCODER_TARGET_REPLACE_MODULE
                 ))
         print(f"create LyCORIS for Text Encoder: {len(self.text_encoder_loras)} modules.")
         if self.train_unet:
-            self.unet_loras = create_modules(LycorisSpecialNetwork.LORA_PREFIX_UNET, unet,
-                                             LycorisSpecialNetwork.UNET_TARGET_REPLACE_MODULE)
+            self.unet_loras = create_modules(
+                unet_prefix,
+                unet,
+                target_replace_modules
+            )
         else:
             self.unet_loras = []
         print(f"create LyCORIS for U-Net: {len(self.unet_loras)} modules.")
+
 
         self.weights_sd = None
 
@@ -371,3 +423,67 @@ class LycorisSpecialNetwork(ToolkitNetworkMixin, LycorisNetwork):
         for lora in self.text_encoder_loras + self.unet_loras:
             assert lora.lora_name not in names, f"duplicated lora name: {lora.lora_name}"
             names.add(lora.lora_name)
+
+    def prepare_optimizer_params(self, text_encoder_lr, unet_lr, default_lr):
+        def enumerate_params(loras):
+            params = []
+            for lora in loras:
+                params.extend(lora.parameters())
+            return params
+
+        self.requires_grad_(True)
+        all_params = []
+
+        if self.text_encoder_loras:
+            param_data = {"params": enumerate_params(self.text_encoder_loras)}
+            if text_encoder_lr is not None:
+                param_data["lr"] = text_encoder_lr
+            all_params.append(param_data)
+
+        if self.unet_loras:
+            param_data = {"params": enumerate_params(self.unet_loras)}
+            if unet_lr is not None:
+                param_data["lr"] = unet_lr
+            all_params.append(param_data)
+
+        return all_params
+
+        
+        # all_params = super().prepare_optimizer_params(unet_lr, default_lr)
+
+        # if self.full_train_in_out:
+        #     if self.is_pixart or self.is_auraflow or self.is_flux:
+        #         all_params.append({"lr": unet_lr, "params": list(self.transformer_pos_embed.parameters())})
+        #         all_params.append({"lr": unet_lr, "params": list(self.transformer_proj_out.parameters())})
+        #     else:
+        #         all_params.append({"lr": unet_lr, "params": list(self.unet_conv_in.parameters())})
+        #         all_params.append({"lr": unet_lr, "params": list(self.unet_conv_out.parameters())})
+
+        # return all_params
+
+
+    def apply_all(self, text_encoder, unet, apply_text_encoder=None, apply_unet=None):
+        assert (
+            apply_text_encoder is not None and apply_unet is not None
+        ), f"internal error: flag not set"
+
+        if apply_text_encoder:
+            print("enable LyCORIS for text encoder")
+        else:
+            self.text_encoder_loras = []
+
+        if apply_unet:
+            print("enable LyCORIS for U-Net")
+        else:
+            self.unet_loras = []
+
+        self.loras = self.text_encoder_loras + self.unet_loras
+
+        for lora in self.loras:
+            lora.apply_to()
+            self.add_module(lora.lora_name, lora)
+
+        if self.weights_sd:
+            # if some weights are not in state dict, it is ok because initial LoRA does nothing (lora_up is initialized by zeros)
+            info = self.load_state_dict(self.weights_sd, False)
+            lprint(f"weights are loaded: {info}")
